@@ -29,6 +29,7 @@ type Storage interface {
 	Ping(ctx context.Context) error
 	PresignUpload(ctx context.Context, key string) (storage.Upload, error)
 	PresignDownload(ctx context.Context, key, filename string) (string, error)
+	Exists(ctx context.Context, key string) (bool, error)
 	Delete(ctx context.Context, key string) error
 }
 
@@ -58,6 +59,7 @@ func Handler(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/notes/{id}", s.getNote)
 	mux.HandleFunc("DELETE /api/notes/{id}", s.deleteNote)
 	mux.HandleFunc("POST /api/notes/{id}/attachment", s.presignAttachmentUpload)
+	mux.HandleFunc("POST /api/notes/{id}/attachment/confirm", s.confirmAttachment)
 	mux.HandleFunc("GET /api/notes/{id}/attachment", s.presignAttachmentDownload)
 
 	return s.recoverer(s.logRequests(s.cors(securityHeaders(mux))))
@@ -137,18 +139,30 @@ func (s *server) deleteNote(w http.ResponseWriter, r *http.Request) {
 }
 
 type attachmentRequest struct {
+	Key      string `json:"key"`
 	Filename string `json:"filename"`
 }
 
 var unsafeFilenameChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
+// cleanFilename returns the base name of a user-supplied filename, or "" when invalid.
+func cleanFilename(raw string) string {
+	name := strings.TrimSpace(path.Base(strings.ReplaceAll(raw, `\`, "/")))
+	if name == "" || name == "." || name == "/" || len(name) > 200 {
+		return ""
+	}
+	return name
+}
+
+// presignAttachmentUpload issues a presigned POST. Nothing is recorded yet:
+// the note only references the object after the upload is confirmed.
 func (s *server) presignAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 	var in attachmentRequest
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	name := strings.TrimSpace(path.Base(strings.ReplaceAll(in.Filename, `\`, "/")))
-	if name == "" || name == "." || name == "/" || len(name) > 200 {
+	name := cleanFilename(in.Filename)
+	if name == "" {
 		writeError(w, http.StatusUnprocessableEntity, "a filename up to 200 characters is required")
 		return
 	}
@@ -164,10 +178,46 @@ func (s *server) presignAttachmentUpload(w http.ResponseWriter, r *http.Request)
 		s.internalError(w, r, "presign upload", err)
 		return
 	}
-	if err := s.Notes.SetAttachment(r.Context(), id, key, name); s.handleLookupError(w, r, err) {
+	writeJSON(w, http.StatusOK, upload)
+}
+
+// confirmAttachment records an uploaded object after verifying it exists and
+// belongs to the note; a replaced attachment's previous object is deleted.
+func (s *server) confirmAttachment(w http.ResponseWriter, r *http.Request) {
+	var in attachmentRequest
+	if !decodeJSON(w, r, &in) {
 		return
 	}
-	writeJSON(w, http.StatusOK, upload)
+	id := r.PathValue("id")
+	name := cleanFilename(in.Filename)
+	if name == "" || !strings.HasPrefix(in.Key, "notes/"+id+"/") || strings.Contains(in.Key, "..") {
+		writeError(w, http.StatusUnprocessableEntity, "invalid key or filename")
+		return
+	}
+
+	note, err := s.Notes.Get(r.Context(), id)
+	if s.handleLookupError(w, r, err) {
+		return
+	}
+	exists, err := s.Storage.Exists(r.Context(), in.Key)
+	if err != nil {
+		s.internalError(w, r, "stat attachment", err)
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusUnprocessableEntity, "upload not found")
+		return
+	}
+	if err := s.Notes.SetAttachment(r.Context(), id, in.Key, name); s.handleLookupError(w, r, err) {
+		return
+	}
+	if note.AttachmentKey != "" && note.AttachmentKey != in.Key {
+		if err := s.Storage.Delete(r.Context(), note.AttachmentKey); err != nil {
+			s.Log.Warn("delete replaced attachment", "key", note.AttachmentKey, "error", err)
+		}
+	}
+	note.AttachmentKey, note.AttachmentName = in.Key, name
+	writeJSON(w, http.StatusOK, note)
 }
 
 func (s *server) presignAttachmentDownload(w http.ResponseWriter, r *http.Request) {

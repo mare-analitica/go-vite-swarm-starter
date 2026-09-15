@@ -79,6 +79,7 @@ func (f *fakeRepo) SetAttachment(_ context.Context, id, key, name string) error 
 type fakeStorage struct {
 	pingErr error
 	deleted []string
+	objects map[string]bool
 }
 
 func (f *fakeStorage) Ping(context.Context) error { return f.pingErr }
@@ -87,6 +88,9 @@ func (f *fakeStorage) PresignUpload(_ context.Context, key string) (storage.Uplo
 }
 func (f *fakeStorage) PresignDownload(_ context.Context, key, _ string) (string, error) {
 	return "https://s3.example.com/app/" + key, nil
+}
+func (f *fakeStorage) Exists(_ context.Context, key string) (bool, error) {
+	return f.objects[key], nil
 }
 func (f *fakeStorage) Delete(_ context.Context, key string) error {
 	f.deleted = append(f.deleted, key)
@@ -109,7 +113,7 @@ type fixture struct {
 }
 
 func newFixture(dbErr error) *fixture {
-	f := &fixture{repo: newFakeRepo(), storage: &fakeStorage{}, events: &fakeEvents{}}
+	f := &fixture{repo: newFakeRepo(), storage: &fakeStorage{objects: map[string]bool{}}, events: &fakeEvents{}}
 	f.handler = Handler(Deps{
 		Notes:      f.repo,
 		Database:   fakePinger{err: dbErr},
@@ -192,9 +196,21 @@ func TestAttachmentLifecycle(t *testing.T) {
 	}
 	var up storage.Upload
 	_ = json.Unmarshal(rec.Body.Bytes(), &up)
-	key := up.Fields["key"]
+	key := up.Key
 	if !strings.HasPrefix(key, "notes/n1/") || strings.Contains(key, "..") || strings.Contains(key, " ") {
 		t.Errorf("unsafe object key %q", key)
+	}
+	if f.repo.notes["n1"].AttachmentKey != "" {
+		t.Fatal("presigning must not record the attachment before the upload is confirmed")
+	}
+
+	confirm := `{"key":"` + key + `","filename":"Report Q3.pdf"}`
+	if rec := f.do(http.MethodPost, "/api/notes/n1/attachment/confirm", confirm); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("confirm without uploaded object: status = %d", rec.Code)
+	}
+	f.storage.objects[key] = true
+	if rec := f.do(http.MethodPost, "/api/notes/n1/attachment/confirm", confirm); rec.Code != http.StatusOK {
+		t.Fatalf("confirm status = %d, body = %s", rec.Code, rec.Body)
 	}
 	if name := f.repo.notes["n1"].AttachmentName; name != "Report Q3.pdf" {
 		t.Errorf("attachment name = %q", name)
@@ -208,6 +224,25 @@ func TestAttachmentLifecycle(t *testing.T) {
 	}
 	if len(f.storage.deleted) != 1 || f.storage.deleted[0] != key {
 		t.Errorf("attachment object must be deleted, got %v", f.storage.deleted)
+	}
+}
+
+func TestConfirmRejectsForeignKeysAndReplacesPrevious(t *testing.T) {
+	f := newFixture(nil)
+	f.do(http.MethodPost, "/api/notes", `{"title":"x"}`)
+	f.storage.objects["notes/other/abc-a.txt"] = true
+	if rec := f.do(http.MethodPost, "/api/notes/n1/attachment/confirm", `{"key":"notes/other/abc-a.txt","filename":"a.txt"}`); rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("foreign key status = %d", rec.Code)
+	}
+
+	f.storage.objects["notes/n1/old-a.txt"] = true
+	f.storage.objects["notes/n1/new-b.txt"] = true
+	f.do(http.MethodPost, "/api/notes/n1/attachment/confirm", `{"key":"notes/n1/old-a.txt","filename":"a.txt"}`)
+	if rec := f.do(http.MethodPost, "/api/notes/n1/attachment/confirm", `{"key":"notes/n1/new-b.txt","filename":"b.txt"}`); rec.Code != http.StatusOK {
+		t.Fatalf("replace status = %d", rec.Code)
+	}
+	if len(f.storage.deleted) != 1 || f.storage.deleted[0] != "notes/n1/old-a.txt" {
+		t.Errorf("previous attachment must be deleted, got %v", f.storage.deleted)
 	}
 }
 
