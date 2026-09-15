@@ -1,0 +1,91 @@
+# Stack "ci": Jenkins, configured as code (deploy/jenkins).
+#
+#   deploy stack ci      (requires the platform stack, the buildkitd container
+#                         and the deploy SSH key from deploy/host/bootstrap.sh)
+#
+# Jenkins has NO access to the host's Docker API: it builds through the
+# rootless BuildKit container and pushes to the local registry. The only way
+# it changes production is "deploy app" over SSH, restricted by a forced
+# command to application services and images pinned by digest.
+
+services:
+  jenkins:
+    image: 127.0.0.1:5000/platform/jenkins:${JENKINS_IMAGE_TAG}
+    environment:
+      CASC_JENKINS_CONFIG: /casc
+      CI_DOMAIN: ${CI_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN}
+      GIT_REPOSITORY_URL: ${GIT_REPOSITORY_URL}
+      GIT_BRANCH: ${GIT_BRANCH}
+      GIT_CREDENTIALS_ID: ${GIT_CREDENTIALS_ID:-}
+      # The host as seen from containers (docker_gwbridge gateway).
+      DEPLOY_SSH_HOST: ${DEPLOY_SSH_HOST}
+    configs:
+      - { source: jenkins_casc, target: /casc/jenkins.yaml, mode: 0444 }
+      - { source: jenkins_jobs, target: /casc/jobs.yaml, mode: 0444 }
+    secrets:
+      - jenkins_admin_password
+      - registry_ci_password
+      - jenkins_git_token
+      # ssh refuses a private key readable by others: owned by jenkins (1000), 0400.
+      - { source: ci_deploy_ssh_key, target: ci_deploy_ssh_key, uid: "1000", gid: "1000", mode: 0400 }
+      - { source: ci_deploy_known_hosts, target: ci_deploy_known_hosts, mode: 0444 }
+    volumes:
+      - jenkins_home:/var/jenkins_home
+    networks: [edge, ci]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # First boot (plugins + configuration) on a small VPS takes minutes.
+      start_period: 300s
+    deploy:
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 60s
+      rollback_config:
+        order: stop-first
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.jenkins.rule=Host(`${CI_DOMAIN}`)
+        - traefik.http.routers.jenkins.entrypoints=websecure
+        # Jenkins has its own login; the allowlist is defense in depth.
+        - traefik.http.routers.jenkins.middlewares=admin-allowlist@swarm
+        - traefik.http.services.jenkins.loadbalancer.server.port=8080
+      resources:
+        limits: { memory: 1024M }
+
+configs:
+  jenkins_casc:
+    name: jenkins_casc_${JENKINS_CASC_HASH}
+    file: ../jenkins/casc/jenkins.yaml
+  jenkins_jobs:
+    name: jenkins_jobs_${JENKINS_JOBS_HASH}
+    file: ../jenkins/casc/jobs.yaml
+
+secrets:
+  jenkins_admin_password:
+    external: true
+    name: ${JENKINS_ADMIN_PASSWORD_SECRET}
+  registry_ci_password:
+    external: true
+    name: ${REGISTRY_CI_PASSWORD_SECRET}
+  jenkins_git_token:
+    external: true
+    name: ${JENKINS_GIT_TOKEN_SECRET}
+  ci_deploy_ssh_key:
+    external: true
+    name: ${CI_DEPLOY_SSH_KEY_SECRET}
+  ci_deploy_known_hosts:
+    external: true
+    name: ${CI_DEPLOY_KNOWN_HOSTS_SECRET}
+
+networks:
+  edge: { external: true }
+  ci: { external: true }
+
+volumes:
+  jenkins_home:
