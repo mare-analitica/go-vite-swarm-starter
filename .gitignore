@@ -1,0 +1,32 @@
+# --- Secrets: never commit ------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials
+*.tfvars
+
+# --- Host-specific configuration ------------------------------------------
+deploy/config/*.env
+!deploy/config/example.env
+
+# --- Go --------------------------------------------------------------------
+/backend/bin/
+*.test
+*.out
+coverage.*
+
+# --- Frontend --------------------------------------------------------------
+node_modules/
+/frontend/dist/
+
+# --- Tooling / OS ----------------------------------------------------------
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.claude/settings.local.json
