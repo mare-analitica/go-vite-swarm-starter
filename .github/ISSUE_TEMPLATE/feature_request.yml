@@ -1,0 +1,35 @@
+name: Feature request
+description: A new capability or an improvement
+title: "feat: "
+labels: ["type: feature"]
+body:
+  - type: checkboxes
+    id: sanitization
+    attributes:
+      label: Sanitization
+      options:
+        - label: I removed real hostnames, domains, IP addresses, customer names, credentials and tokens from everything below.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve? The starter aims to stay small; explain why it belongs here.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] ...
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

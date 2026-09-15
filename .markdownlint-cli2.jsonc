@@ -12,7 +12,7 @@
     "MD035": { "style": "---" }
   },
   "ignores": [
-    "node_modules/**",
+    "**/node_modules/**",
     "LICENSE",
     // GitHub renders the PR template inside the PR body: no top-level heading.
     ".github/pull_request_template.md"
