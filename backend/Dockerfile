@@ -17,4 +17,6 @@ COPY --from=build --chmod=0555 /out/api /usr/local/bin/api
 # 65532 = "nonroot" in distroless (numeric so the host can resolve it)
 USER 65532:65532
 EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["/usr/local/bin/api", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/api"]

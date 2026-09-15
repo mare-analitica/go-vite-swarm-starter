@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Secrets generated ON THE HOST, never in Git or in environment variables.
 #
-#   ensure_secret <name> [alnum|hex]   create if missing and publish
+#   ensure_secret <name> [alnum|hex|access]   create if missing and publish
 #   require_secret <name>              human-provided (e.g. a vendor key): publish only
 #   ensure_htpasswd <name> <user> <password-secret>   bcrypt htpasswd derived from a secret
 #
@@ -32,6 +32,7 @@ ensure_secret() {
         case "$format" in
             alnum) ( umask 077; head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "$file" ) ;;
             hex)   ( umask 077; head -c 32 /dev/urandom | od -An -vtx1 | tr -dc '0-9a-f' > "$file" ) ;;
+            access) ( umask 077; head -c 64 /dev/urandom | base64 | tr -dc 'A-Z0-9' | head -c 20 > "$file" ) ;;
             *) log "unknown secret format: $format"; return 1 ;;
         esac
         log "secret '$name' generated"

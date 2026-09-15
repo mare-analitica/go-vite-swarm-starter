@@ -1,0 +1,76 @@
+# Stack "app": the example system (Go API + Vite frontend).
+#
+#   Created by the first pipeline run (deploy app app_api / app_web), or by
+#   deploy stack app once both images exist. Requires platform and automation.
+#
+# Images come from the local registry pinned by digest; deploy keeps the last
+# healthy image of each service in /var/lib/starter/images, so a stack
+# redeploy never reverts what the pipeline shipped.
+#
+# The API reads every credential from a file (*_FILE): nothing sensitive is in
+# its environment or in docker inspect. Its PostgreSQL role and MinIO user can
+# reach only this system's database and bucket (deploy/hooks/app.sh).
+
+x-start-first: &start-first
+  update_config:
+    parallelism: 1
+    order: start-first
+    failure_action: rollback
+    monitor: 30s
+  rollback_config:
+    order: start-first
+
+services:
+  api:
+    image: ${APP_API_IMAGE:?no image yet, run the pipeline first}
+    environment:
+      CORS_ALLOWED_ORIGIN: https://${APP_DOMAIN}
+      DB_HOST: platform_postgres
+      DB_NAME: app
+      DB_USER: app
+      DB_PASSWORD_FILE: /run/secrets/app_db_password
+      S3_ENDPOINT: minio:9000
+      S3_PUBLIC_ENDPOINT: https://${S3_DOMAIN}
+      S3_BUCKET: app
+      S3_ACCESS_KEY_FILE: /run/secrets/app_s3_access_key
+      S3_SECRET_KEY_FILE: /run/secrets/app_s3_secret_key
+      N8N_WEBHOOK_URL: http://automation_n8n:5678/webhook/note-created
+    secrets: [app_db_password, app_s3_access_key, app_s3_secret_key]
+    networks: [edge, data]
+    deploy:
+      <<: *start-first
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.app-api.rule=Host(`${API_DOMAIN}`)
+        - traefik.http.routers.app-api.entrypoints=websecure
+        - traefik.http.services.app-api.loadbalancer.server.port=8080
+      resources:
+        limits: { memory: 128M }
+
+  web:
+    image: ${APP_WEB_IMAGE:?no image yet, run the pipeline first}
+    networks: [edge]
+    deploy:
+      <<: *start-first
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.app-web.rule=Host(`${APP_DOMAIN}`)
+        - traefik.http.routers.app-web.entrypoints=websecure
+        - traefik.http.services.app-web.loadbalancer.server.port=8080
+      resources:
+        limits: { memory: 64M }
+
+secrets:
+  app_db_password:
+    external: true
+    name: ${APP_DB_PASSWORD_SECRET}
+  app_s3_access_key:
+    external: true
+    name: ${APP_S3_ACCESS_KEY_SECRET}
+  app_s3_secret_key:
+    external: true
+    name: ${APP_S3_SECRET_KEY_SECRET}
+
+networks:
+  edge: { external: true }
+  data: { external: true }
