@@ -1,0 +1,131 @@
+# Local development environment. DEVELOPMENT-ONLY credentials: every value
+# here is public and must never be reused on a server (the Swarm stacks in
+# deploy/ generate real secrets on the host).
+#
+#   make dev    start everything, then open http://localhost:5173 (make web)
+#   make down   stop (keeps data)      make clean   stop and delete data
+
+name: starter-dev
+
+x-images:
+  postgres: &postgres-image postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+  # MinIO community edition no longer receives updates: see docs/object-storage.md
+  minio: &minio-image quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772@sha256:cf3dadcfa1fb0324f43958bad1abba986d53c4ecc04d4d50b46c7dcda28bd3cd
+  mc: &mc-image quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+  n8n: &n8n-image n8nio/n8n:2.38.7@sha256:a8c95f75c6fdf65f5f2b7a7b354744eaa1c62bb911b5c00af6499c3f38e4cd32
+
+services:
+  postgres:
+    image: *postgres-image
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev-postgres
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./dev/postgres-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: *minio-image
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: dev-minio-root
+      MINIO_ROOT_PASSWORD: dev-minio-root-password
+    volumes:
+      - minio:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: bucket, bucket-scoped policy and the app's own credentials,
+  # the same isolation the server hook applies.
+  minio-init:
+    image: *mc-image
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./dev/minio-init.sh:/init.sh:ro
+    environment:
+      MINIO_ROOT_USER: dev-minio-root
+      MINIO_ROOT_PASSWORD: dev-minio-root-password
+      APP_BUCKET: app
+      APP_ACCESS_KEY: dev-app-access
+      APP_SECRET_KEY: dev-app-secret-key
+    entrypoint: ["sh", "/init.sh"]
+    restart: "no"
+
+  # One-shot: imports and publishes the example workflow that receives
+  # note.created events (dev/n8n), before the editor starts.
+  n8n-import:
+    image: *n8n-image
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &n8n-env
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: dev-n8n
+      N8N_ENCRYPTION_KEY: dev-n8n-encryption-key
+      N8N_SECURE_COOKIE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      GENERIC_TIMEZONE: UTC
+    volumes:
+      - ./dev/n8n:/workflows:ro
+    entrypoint:
+      - sh
+      - -c
+      - n8n import:workflow --input=/workflows/note-created.json && n8n publish:workflow --id=starterNoteCreated
+    restart: "no"
+
+  n8n:
+    image: *n8n-image
+    depends_on:
+      n8n-import:
+        condition: service_completed_successfully
+    environment: *n8n-env
+    volumes:
+      - n8n:/home/node/.n8n
+    ports:
+      - "127.0.0.1:5678:5678"
+
+  api:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: postgres
+      DB_NAME: app
+      DB_USER: app
+      DB_PASSWORD: dev-app
+      S3_ENDPOINT: minio:9000
+      # The browser reaches MinIO on localhost; presigned URLs are signed for it.
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_BUCKET: app
+      S3_ACCESS_KEY: dev-app-access
+      S3_SECRET_KEY: dev-app-secret-key
+      CORS_ALLOWED_ORIGIN: http://localhost:5173
+      N8N_WEBHOOK_URL: http://n8n:5678/webhook/note-created
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres:
+  minio:
+  n8n:
