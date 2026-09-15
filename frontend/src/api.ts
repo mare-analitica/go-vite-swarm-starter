@@ -13,6 +13,7 @@ export interface Note {
 interface PresignedUpload {
   url: string
   fields: Record<string, string>
+  key: string
 }
 
 export class ApiError extends Error {
@@ -61,6 +62,11 @@ export const api = {
       const tooLarge = (await res.text()).includes('EntityTooLarge')
       throw new ApiError(res.status, tooLarge ? 'File is too large' : 'Upload failed')
     }
+    // The note references the file only after the API verifies it was stored.
+    await request(`/api/notes/${encodeURIComponent(id)}/attachment/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ key: presigned.key, filename: file.name }),
+    })
   },
 
   attachmentUrl: (id: string) =>

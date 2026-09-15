@@ -24,7 +24,7 @@ import (
 type Upload struct {
 	URL    string            `json:"url"`
 	Fields map[string]string `json:"fields"`
-	Key    string            `json:"-"`
+	Key    string            `json:"key"`
 }
 
 // S3 talks to the bucket through the internal endpoint and signs browser
@@ -106,6 +106,18 @@ func (s *S3) PresignDownload(ctx context.Context, key, filename string) (string,
 		return "", err
 	}
 	return u.String(), nil
+}
+
+// Exists reports whether an object is present in the bucket.
+func (s *S3) Exists(ctx context.Context, key string) (bool, error) {
+	_, err := s.internal.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if minio.ToErrorResponse(err).Code == "NoSuchKey" {
+		return false, nil
+	}
+	return false, err
 }
 
 // Delete removes an object; deleting a missing object is not an error in S3.
