@@ -19,9 +19,6 @@ jenkins:
   # Builds run on the controller's executors against the remote BuildKit;
   # there are no agents, so the agent port stays closed.
   slaveAgentPort: -1
-  crumbIssuer:
-    standard:
-      excludeClientIPFromCrumb: false
 
 credentials:
   system:
