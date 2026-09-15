@@ -104,7 +104,7 @@ jobs:
           persist-credentials: false
       - name: shellcheck
         run: |
-          mapfile -t files < <(git ls-files '*.sh')
+          mapfile -t files < <(git ls-files '*.sh' 'deploy/bin/*')
           [ "${#files[@]}" -eq 0 ] && { echo "No shell scripts."; exit 0; }
           docker run --rm -v "$PWD:/mnt:ro" -w /mnt "$SHELLCHECK_IMAGE" --external-sources "${files[@]}"
       - name: hadolint
