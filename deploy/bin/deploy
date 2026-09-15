@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# deploy - the only way changes reach the Swarm on the host.
+#
+# Every mutating command takes a global lock, loads host configuration and
+# per-system secrets, validates before touching anything, waits for healthy
+# convergence, rolls back on failure and appends to an audit history.
+set -Eeuo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_DIR="${STARTER_REPO_DIR:-$(cd "$(dirname "$SELF")/../.." && pwd)}"
+DEPLOY_DIR="$REPO_DIR/deploy"
+CONFIG_FILE="${STARTER_CONFIG:-/etc/starter/config.env}"
+SECRETS_DIR="${STARTER_SECRETS_DIR:-/etc/starter/secrets}"
+STATE_DIR="${STARTER_STATE_DIR:-/var/lib/starter}"
+LOCK_FILE="${STARTER_LOCK_FILE:-/run/lock/starter-deploy.lock}"
+HISTORY_FILE="$STATE_DIR/history.jsonl"
+ACTOR="${DEPLOY_ACTOR:-${SUDO_USER:-$(id -un)}}"
+
+LOCAL_IMAGE_RE='^127\.0\.0\.1:5000/[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[a-f0-9]{64}$'
+NAME_RE='^[a-z][a-z0-9-]*$'
+SERVICE_RE='^[a-z][a-z0-9-]*_[a-z][a-z0-9_-]*$'
+
+usage() {
+    cat <<'EOF'
+Usage: deploy <command> [arguments]
+
+Commands:
+  stack <name>              Deploy deploy/stacks/<name>.yml (runs deploy/hooks/<name>.sh first)
+  app <service> <image>     Update one application service to an image from the local
+                            registry pinned by digest (127.0.0.1:5000/...@sha256:...)
+  status                    Stacks, services and anything not converged
+  history [count]           Last deployments (default 20)
+  help                      Show this help
+
+Mutating commands take a global lock, refuse a dirty repository and empty
+variables, wait until every service is healthy and roll back on failure.
+
+Environment:
+  DEPLOY_TIMEOUT   seconds to wait for convergence (default 600)
+  ALLOW_DIRTY=1    deploy from a repository with uncommitted changes (break-glass)
+EOF
+}
+
+log() { printf '%s deploy: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+# ------------------------------------------------------------------ history
+
+record() { # record <action> <target> <result> [image] [detail]
+    local started="${DEPLOY_STARTED:-$(date +%s)}"
+    install -d -m 0750 "$STATE_DIR"
+    jq -nc \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg actor "$ACTOR" \
+        --arg action "$1" --arg target "$2" --arg result "$3" \
+        --arg image "${4:-}" --arg detail "${5:-}" \
+        --arg commit "$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo none)" \
+        --argjson seconds "$(( $(date +%s) - started ))" \
+        '{ts:$ts, actor:$actor, action:$action, target:$target, result:$result,
+          image:$image, commit:$commit, seconds:$seconds, detail:$detail}
+         | with_entries(select(.value != ""))' >> "$HISTORY_FILE"
+}
+
+# ------------------------------------------------------------------ checks
+
+acquire_lock() {
+    install -d "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "another deploy is running; waiting for the lock"
+        flock -w "${LOCK_WAIT:-900}" 9 || die "timed out waiting for the deploy lock"
+    fi
+}
+
+check_repo() {
+    [ "${ALLOW_DIRTY:-0}" = 1 ] && { log "warning: ALLOW_DIRTY=1, repository state not checked"; return; }
+    git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO_DIR is not a git checkout"
+    if [ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ]; then
+        die "repository has uncommitted changes: commit them (the host follows Git) or set ALLOW_DIRTY=1"
+    fi
+}
+
+image_var() { printf '%s_IMAGE' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; }
+
+load_env() {
+    [ -r "$CONFIG_FILE" ] || die "missing host configuration $CONFIG_FILE (copy deploy/config/example.env)"
+    set -a
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+    set +a
+    # shellcheck source=deploy/lib/secrets.sh
+    . "$DEPLOY_DIR/lib/secrets.sh"
+    local lib
+    for lib in "$DEPLOY_DIR"/lib/*.sh; do
+        # shellcheck source=/dev/null
+        [ "$lib" = "$DEPLOY_DIR/lib/secrets.sh" ] || . "$lib"
+    done
+    # Last known good application images, so a stack deploy never reverts them.
+    local file
+    for file in "$STATE_DIR"/images/*; do
+        [ -f "$file" ] || continue
+        export "$(image_var "$(basename "$file")")=$(cat "$file")"
+    done
+}
+
+run_hook() {
+    local hook="$DEPLOY_DIR/hooks/$1.sh"
+    [ -f "$hook" ] || return 0
+    log "running hook $1"
+    # shellcheck source=/dev/null
+    . "$hook"
+}
+
+check_vars() { # every ${VAR} without a default must be set and non-empty
+    local file="$1" var missing=()
+    while read -r var; do
+        [ -n "${!var:-}" ] || missing+=("$var")
+    done < <(grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' "$file" | sed 's/^..//; s/.$//' | sort -u)
+    [ "${#missing[@]}" -eq 0 ] || die "empty variables in $(basename "$file"): ${missing[*]}"
+}
+
+warn_unpinned() {
+    local image
+    while read -r image; do
+        [[ "$image" == *@sha256:* ]] || log "warning: image not pinned by digest: $image"
+    done < <(docker stack config -c "$1" 2>/dev/null | awk '$1 == "image:" {print $2}' | tr -d '"' | sort -u)
+}
+
+# ------------------------------------------------------------------ convergence
+
+update_marks() { # "<service>|<update started at>" for every service of a stack
+    docker service ls -q --filter "label=com.docker.stack.namespace=$1" \
+        | xargs -r docker service inspect --format '{{.Spec.Name}}|{{with .UpdateStatus}}{{.StartedAt}}{{end}}'
+}
+
+update_state() { # update_state <service> <mark before deploy> -> "" when untouched by this deploy
+    local line
+    line="$(docker service inspect --format '{{with .UpdateStatus}}{{.StartedAt}}|{{.State}}{{end}}' "$1" 2>/dev/null || true)"
+    if [ -n "$line" ] && [ "${line%%|*}" != "$2" ]; then printf '%s' "${line#*|}"; fi
+}
+
+mark_of() { # mark_of <service> <marks file>
+    { grep -F "$1|" "$2" || true; } | head -1 | cut -d'|' -f2-
+}
+
+replicas_ok() { # "1/1", "2/2 (max 1 per node)", "0/1 (1/1 completed)"
+    local r="$1" pair
+    if [[ "$r" =~ \(([0-9]+)/([0-9]+)\ completed\) ]]; then
+        [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ]
+        return
+    fi
+    pair="${r%% *}"
+    [ "${pair%/*}" = "${pair#*/}" ]
+}
+
+wait_stack() { # wait_stack <stack> <marks file>
+    local stack="$1" marks="$2" deadline stable=0 name replicas state pending failed
+    deadline=$(( $(date +%s) + ${DEPLOY_TIMEOUT:-600} ))
+    sleep 5
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        pending=() failed=()
+        while IFS='|' read -r name replicas; do
+            state="$(update_state "$name" "$(mark_of "$name" "$marks")")"
+            case "$state" in
+                paused|rollback_paused|rollback_completed) failed+=("$name:$state") ;;
+                updating|rollback_started) pending+=("$name:$state") ;;
+                *) replicas_ok "$replicas" || pending+=("$name:$replicas") ;;
+            esac
+        done < <(docker service ls --filter "label=com.docker.stack.namespace=$stack" --format '{{.Name}}|{{.Replicas}}')
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+            log "failed: ${failed[*]}"
+            FAILED_SERVICES="${failed[*]}"
+            return 1
+        fi
+        if [ "${#pending[@]}" -eq 0 ]; then
+            stable=$((stable + 1))
+            [ "$stable" -ge 2 ] && return 0
+        else
+            stable=0
+            log "waiting: ${pending[*]}"
+        fi
+        sleep 5
+    done
+    FAILED_SERVICES="timeout: ${pending[*]:-unknown}"
+    log "timed out after ${DEPLOY_TIMEOUT:-600}s: ${pending[*]:-}"
+    return 1
+}
+
+rollback_pending() { # roll back services of this deploy that are stuck mid-update
+    local stack="$1" marks="$2" name state
+    while read -r name; do
+        state="$(update_state "$name" "$(mark_of "$name" "$marks")")"
+        case "$state" in
+            updating|paused)
+                log "rolling back $name"
+                docker service rollback --detach "$name" >/dev/null 2>&1 || log "no previous version of $name"
+                ;;
+        esac
+    done < <(docker service ls --filter "label=com.docker.stack.namespace=$stack" --format '{{.Name}}')
+}
+
+service_logs_hint() {
+    local name
+    for name in $1; do
+        name="${name%%:*}"
+        log "last tasks of $name:"
+        docker service ps --no-trunc --format '  {{.CurrentState}}  {{.Error}}' "$name" 2>/dev/null | head -3 >&2 || true
+    done
+}
+
+# ------------------------------------------------------------------ commands
+
+deploy_stack() { # assumes lock, repo check and environment are done
+    local name="$1" file="$DEPLOY_DIR/stacks/$1.yml" marks
+    run_hook "$name"
+    check_vars "$file"
+    docker stack config -c "$file" >/dev/null || die "invalid stack file $file"
+    warn_unpinned "$file"
+
+    marks="$(mktemp)"
+    update_marks "$name" > "$marks"
+    log "deploying stack $name"
+    docker stack deploy --prune --with-registry-auth --detach=true -c "$file" "$name" >/dev/null
+
+    if wait_stack "$name" "$marks"; then
+        rm -f "$marks"
+        log "stack $name is healthy"
+        return 0
+    fi
+    rollback_pending "$name" "$marks"
+    service_logs_hint "${FAILED_SERVICES:-}"
+    rm -f "$marks"
+    return 1
+}
+
+cmd_stack() {
+    local name="${1:-}"
+    [[ "$name" =~ $NAME_RE ]] || die "usage: deploy stack <name>"
+    [ -f "$DEPLOY_DIR/stacks/$name.yml" ] || die "unknown stack: $name (no deploy/stacks/$name.yml)"
+    acquire_lock
+    DEPLOY_STARTED="$(date +%s)"
+    check_repo
+    load_env
+    if deploy_stack "$name"; then
+        record stack "$name" success
+    else
+        record stack "$name" failure "" "${FAILED_SERVICES:-}"
+        die "stack $name did not converge; failed updates were rolled back"
+    fi
+}
+
+cmd_app() {
+    local service="${1:-}" image="${2:-}" stack state_file previous mark state deadline replicas
+    [[ "$service" =~ $SERVICE_RE ]] || die "usage: deploy app <service> <image>"
+    [[ "$image" =~ $LOCAL_IMAGE_RE ]] || die "image must come from the local registry pinned by digest: 127.0.0.1:5000/<name>[:tag]@sha256:<64 hex>"
+    acquire_lock
+    DEPLOY_STARTED="$(date +%s)"
+    check_repo
+    load_env
+    [[ " ${APP_SERVICES:-} " == *" $service "* ]] || die "$service is not an application service (APP_SERVICES in $CONFIG_FILE)"
+    stack="${service%%_*}"
+    state_file="$STATE_DIR/images/$service"
+    install -d -m 0750 "$STATE_DIR/images"
+
+    # First deploy: the service does not exist yet. Record the image and create
+    # the stack once every application service of that stack has one.
+    if ! docker service inspect "$service" >/dev/null 2>&1; then
+        local svc missing=()
+        printf '%s\n' "$image" > "$state_file"
+        export "$(image_var "$service")=$image"
+        for svc in $APP_SERVICES; do
+            [ "${svc%%_*}" = "$stack" ] && [ ! -s "$STATE_DIR/images/$svc" ] && missing+=("$svc")
+        done
+        if [ "${#missing[@]}" -gt 0 ]; then
+            record app "$service" pending "$image" "waiting for ${missing[*]}"
+            log "image recorded; stack $stack is created when ${missing[*]} also has an image"
+            return 0
+        fi
+        if deploy_stack "$stack"; then
+            record app "$service" success "$image" "created stack $stack"
+            return 0
+        fi
+        rm -f "$state_file"
+        record app "$service" failure "$image" "${FAILED_SERVICES:-}"
+        die "stack $stack did not converge"
+    fi
+
+    previous="$(docker service inspect --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' "$service")"
+    if [ "$previous" = "$image" ]; then
+        printf '%s\n' "$image" > "$state_file"
+        record app "$service" unchanged "$image"
+        log "$service already runs this image"
+        return 0
+    fi
+
+    mark="$(docker service inspect --format '{{with .UpdateStatus}}{{.StartedAt}}{{end}}' "$service")"
+    log "updating $service"
+    docker service update --detach --with-registry-auth --image "$image" "$service" >/dev/null
+
+    deadline=$(( $(date +%s) + ${DEPLOY_TIMEOUT:-600} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 5
+        state="$(update_state "$service" "$mark")"
+        replicas="$(docker service ls --filter "name=^${service}\$" --format '{{.Replicas}}' | head -1)"
+        case "$state" in
+            completed)
+                if replicas_ok "$replicas"; then
+                    printf '%s\n' "$image" > "$state_file"
+                    record app "$service" success "$image"
+                    log "$service is healthy on the new image"
+                    return 0
+                fi
+                ;;
+            paused)
+                log "update paused after a failure; rolling back"
+                docker service rollback --detach "$service" >/dev/null
+                ;;
+            rollback_completed|rollback_paused)
+                service_logs_hint "$service"
+                record app "$service" rolled-back "$image" "previous: $previous"
+                die "$service failed on the new image and was rolled back to the previous one"
+                ;;
+            *) log "waiting: $service ${state:-starting} $replicas" ;;
+        esac
+    done
+    docker service rollback --detach "$service" >/dev/null 2>&1 || true
+    record app "$service" failure "$image" "timeout"
+    die "$service did not converge in ${DEPLOY_TIMEOUT:-600}s; rollback requested"
+}
+
+cmd_status() {
+    docker stack ls
+    echo
+    docker service ls --format 'table {{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}' \
+        | sed -E 's/@sha256:([a-f0-9]{12})[a-f0-9]{52}/@\1/'
+    local name replicas problems=0
+    while IFS='|' read -r name replicas; do
+        replicas_ok "$replicas" && continue
+        [ "$problems" -eq 0 ] && printf '\nNot converged:\n'
+        problems=1
+        printf '  %s %s\n' "$name" "$replicas"
+        docker service ps --no-trunc --format '    {{.CurrentState}}  {{.Error}}' "$name" | head -2
+    done < <(docker service ls --format '{{.Name}}|{{.Replicas}}')
+}
+
+cmd_history() {
+    local count="${1:-20}"
+    [[ "$count" =~ ^[0-9]{1,4}$ ]] || die "usage: deploy history [count]"
+    [ -f "$HISTORY_FILE" ] || { echo "no deployments recorded"; return; }
+    tail -n "$count" "$HISTORY_FILE" | jq -r '[.ts, .actor, .action, .target, .result, (.image // "" | sub("@sha256:(?<d>.{12}).*"; "@\(.d)")), .commit, "\(.seconds)s", (.detail // "")] | @tsv'
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+    case "$command" in
+        stack) cmd_stack "$@" ;;
+        app) cmd_app "$@" ;;
+        status) cmd_status ;;
+        history) cmd_history "$@" ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
