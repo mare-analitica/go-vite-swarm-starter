@@ -42,7 +42,7 @@ EOF
 }
 
 log() { printf '%s deploy: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-die() { log "error: $*"; exit 1; }
+die() { log "error: $*"; : "${FAILED_SERVICES:=$*}"; exit 1; }
 
 # ------------------------------------------------------------------ history
 
@@ -210,6 +210,25 @@ service_logs_hint() {
 
 # ------------------------------------------------------------------ commands
 
+# Any failure (hooks included) exits through "set -e" or die, and this trap
+# writes the failed attempt to the history. Never call deploy_stack or a hook
+# inside "if", "!", "&&" or "||": bash disables "set -e" there, so errors in
+# the function would be silently ignored.
+AUDIT_ACTION="" AUDIT_TARGET="" AUDIT_IMAGE="" AUDIT_FAILURE=failure DISCARD_STATE_FILE=""
+on_exit() {
+    local rc=$?
+    { [ "$rc" -ne 0 ] && [ -n "$AUDIT_ACTION" ]; } || return 0
+    [ -z "$DISCARD_STATE_FILE" ] || rm -f "$DISCARD_STATE_FILE"
+    record "$AUDIT_ACTION" "$AUDIT_TARGET" "$AUDIT_FAILURE" "$AUDIT_IMAGE" "${FAILED_SERVICES:-exit code $rc}" || true
+}
+trap on_exit EXIT
+
+audit_start() { AUDIT_ACTION="$1" AUDIT_TARGET="$2" AUDIT_IMAGE="${3:-}"; }
+audit_done() { # audit_done <result> [detail]
+    record "$AUDIT_ACTION" "$AUDIT_TARGET" "$1" "$AUDIT_IMAGE" "${2:-}"
+    AUDIT_ACTION=""
+}
+
 deploy_stack() { # assumes lock, repo check and environment are done
     local name="$1" file="$DEPLOY_DIR/stacks/$1.yml" marks
     run_hook "$name"
@@ -220,17 +239,18 @@ deploy_stack() { # assumes lock, repo check and environment are done
     marks="$(mktemp)"
     update_marks "$name" > "$marks"
     log "deploying stack $name"
-    docker stack deploy --prune --with-registry-auth --detach=true -c "$file" "$name" >/dev/null
+    docker stack deploy --prune --with-registry-auth --detach=true -c "$file" "$name" >/dev/null \
+        || die "docker stack deploy failed for $name"
+    [ -n "$(docker stack services -q "$name" 2>/dev/null)" ] || die "stack $name has no services after deploy"
 
-    if wait_stack "$name" "$marks"; then
+    if ! wait_stack "$name" "$marks"; then
+        rollback_pending "$name" "$marks"
+        service_logs_hint "${FAILED_SERVICES:-}"
         rm -f "$marks"
-        log "stack $name is healthy"
-        return 0
+        die "stack $name did not converge; failed updates were rolled back"
     fi
-    rollback_pending "$name" "$marks"
-    service_logs_hint "${FAILED_SERVICES:-}"
     rm -f "$marks"
-    return 1
+    log "stack $name is healthy"
 }
 
 cmd_stack() {
@@ -239,14 +259,11 @@ cmd_stack() {
     [ -f "$DEPLOY_DIR/stacks/$name.yml" ] || die "unknown stack: $name (no deploy/stacks/$name.yml)"
     acquire_lock
     DEPLOY_STARTED="$(date +%s)"
+    audit_start stack "$name"
     check_repo
     load_env
-    if deploy_stack "$name"; then
-        record stack "$name" success
-    else
-        record stack "$name" failure "" "${FAILED_SERVICES:-}"
-        die "stack $name did not converge; failed updates were rolled back"
-    fi
+    deploy_stack "$name"
+    audit_done success
 }
 
 cmd_app() {
@@ -255,6 +272,7 @@ cmd_app() {
     [[ "$image" =~ $LOCAL_IMAGE_RE ]] || die "image must come from the local registry pinned by digest: 127.0.0.1:5000/<name>[:tag]@sha256:<64 hex>"
     acquire_lock
     DEPLOY_STARTED="$(date +%s)"
+    audit_start app "$service" "$image"
     check_repo
     load_env
     [[ " ${APP_SERVICES:-} " == *" $service "* ]] || die "$service is not an application service (APP_SERVICES in $CONFIG_FILE)"
@@ -272,23 +290,21 @@ cmd_app() {
             [ "${svc%%_*}" = "$stack" ] && [ ! -s "$STATE_DIR/images/$svc" ] && missing+=("$svc")
         done
         if [ "${#missing[@]}" -gt 0 ]; then
-            record app "$service" pending "$image" "waiting for ${missing[*]}"
+            audit_done pending "waiting for ${missing[*]}"
             log "image recorded; stack $stack is created when ${missing[*]} also has an image"
             return 0
         fi
-        if deploy_stack "$stack"; then
-            record app "$service" success "$image" "created stack $stack"
-            return 0
-        fi
-        rm -f "$state_file"
-        record app "$service" failure "$image" "${FAILED_SERVICES:-}"
-        die "stack $stack did not converge"
+        DISCARD_STATE_FILE="$state_file"
+        deploy_stack "$stack"
+        DISCARD_STATE_FILE=""
+        audit_done success "created stack $stack"
+        return 0
     fi
 
     previous="$(docker service inspect --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' "$service")"
     if [ "$previous" = "$image" ]; then
         printf '%s\n' "$image" > "$state_file"
-        record app "$service" unchanged "$image"
+        audit_done unchanged
         log "$service already runs this image"
         return 0
     fi
@@ -306,7 +322,7 @@ cmd_app() {
             completed)
                 if replicas_ok "$replicas"; then
                     printf '%s\n' "$image" > "$state_file"
-                    record app "$service" success "$image"
+                    audit_done success
                     log "$service is healthy on the new image"
                     return 0
                 fi
@@ -317,14 +333,14 @@ cmd_app() {
                 ;;
             rollback_completed|rollback_paused)
                 service_logs_hint "$service"
-                record app "$service" rolled-back "$image" "previous: $previous"
+                AUDIT_FAILURE=rolled-back FAILED_SERVICES="previous: $previous"
                 die "$service failed on the new image and was rolled back to the previous one"
                 ;;
             *) log "waiting: $service ${state:-starting} $replicas" ;;
         esac
     done
     docker service rollback --detach "$service" >/dev/null 2>&1 || true
-    record app "$service" failure "$image" "timeout"
+    FAILED_SERVICES=timeout
     die "$service did not converge in ${DEPLOY_TIMEOUT:-600}s; rollback requested"
 }
 
