@@ -2,31 +2,37 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 )
 
-// healthcheck probes GET /healthz on the local listener and returns the exit code.
+// healthcheck probes GET /healthz on the loopback interface, using only the
+// port of the listen address, and returns the process exit code.
 func healthcheck(addr string) int {
 	if addr == "" {
 		addr = ":8080"
 	}
-	host, port, err := net.SplitHostPort(addr)
+	_, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return 1
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return 1
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+net.JoinHostPort(host, port)+"/healthz", nil)
+	// G704 (SSRF): the host is fixed to loopback and the port is a validated
+	// integer from the service's own listen address, not request input.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/healthz", port), nil) //nolint:gosec // loopback-only probe, see above
 	if err != nil {
 		return 1
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // loopback-only probe, see above
 	if err != nil {
 		return 1
 	}
