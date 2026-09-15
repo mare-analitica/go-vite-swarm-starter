@@ -1,0 +1,40 @@
+# Jenkins configuration as code. Edit here and run "deploy stack ci":
+# changes made in the web UI are overwritten on the next start.
+jenkins:
+  systemMessage: "Configuration as code: deploy/jenkins/casc (changes in the UI are overwritten)"
+  numExecutors: 2
+  mode: NORMAL
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        # Password: /etc/starter/secrets/jenkins_admin_password on the host,
+        # reapplied on every start (rotate by editing the file + deploy stack ci).
+        - id: admin
+          name: Administrator
+          password: "${readFile:/run/secrets/jenkins_admin_password}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  # Builds run on the controller's executors against the remote BuildKit;
+  # there are no agents, so the agent port stays closed.
+  slaveAgentPort: -1
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: false
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          # Read-only token for a private repository (optional, see docs/ci.md).
+          - usernamePassword:
+              scope: GLOBAL
+              id: "git-read"
+              description: "Git repository read token"
+              username: "x-access-token"
+              password: "${readFile:/run/secrets/jenkins_git_token}"
+
+unclassified:
+  location:
+    url: "https://${CI_DOMAIN}/"

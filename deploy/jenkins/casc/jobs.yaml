@@ -1,0 +1,32 @@
+# Jobs as code (Job DSL). Values come from /etc/starter/config.env through the
+# Jenkins service environment. A new system = another pipelineJob here.
+jobs:
+  - script: |
+      pipelineJob('app') {
+        description('Example system: tests, builds and deploys app_api and app_web (deploy/jenkins/casc/jobs.yaml)')
+        logRotator { numToKeep(20) }
+        properties {
+          disableConcurrentBuilds {}
+          pipelineTriggers {
+            triggers {
+              // No inbound webhook needed: poll the repository every ~2 minutes.
+              pollSCM { scmpoll_spec('H/2 * * * *') }
+            }
+          }
+        }
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('${GIT_REPOSITORY_URL}')
+                  if ('${GIT_CREDENTIALS_ID:-}') { credentials('${GIT_CREDENTIALS_ID:-}') }
+                }
+                branch('*/${GIT_BRANCH}')
+              }
+            }
+            scriptPath('Jenkinsfile')
+            lightweight(true)
+          }
+        }
+      }
