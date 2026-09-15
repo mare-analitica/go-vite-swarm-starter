@@ -1,0 +1,45 @@
+{
+  "id": "starterNoteCreated",
+  "name": "Starter: note created",
+  "active": false,
+  "nodes": [
+    {
+      "id": "0b1f8c2e-6a51-4a1e-9f3d-1a2b3c4d5e01",
+      "name": "Note created webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "5d0c7a90-6f1e-4a7b-8d3a-9c2b1e0f4a11",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "note-created",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "0b1f8c2e-6a51-4a1e-9f3d-1a2b3c4d5e02",
+      "name": "Your automation here",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [260, 0],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Note created webhook": {
+      "main": [
+        [
+          {
+            "node": "Your automation here",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
