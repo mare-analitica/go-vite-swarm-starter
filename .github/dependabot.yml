@@ -26,3 +26,16 @@ updates:
       go:
         patterns:
           - "*"
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: build
+    labels:
+      - "area: frontend"
+    groups:
+      npm:
+        patterns:
+          - "*"
