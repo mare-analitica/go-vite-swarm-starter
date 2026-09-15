@@ -1,0 +1,20 @@
+{
+  // Markdown style for docs and AI skill references.
+  "config": {
+    "default": true,
+    // Long lines are normal in tables and command examples.
+    "MD013": false,
+    // Skill references use tables with inline code and pipes.
+    "MD033": false,
+    // Duplicate headings are fine across sections (e.g. "Symptoms").
+    "MD024": { "siblings_only": true },
+    // Allow "---" as thematic break style consistently.
+    "MD035": { "style": "---" }
+  },
+  "ignores": [
+    "node_modules/**",
+    "LICENSE",
+    // GitHub renders the PR template inside the PR body: no top-level heading.
+    ".github/pull_request_template.md"
+  ]
+}
