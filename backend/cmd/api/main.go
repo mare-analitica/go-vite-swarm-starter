@@ -22,6 +22,12 @@ import (
 var version = "dev"
 
 func main() {
+	// "api healthcheck" lets the container HEALTHCHECK probe the server from
+	// inside a distroless image, which has no shell, curl or wget.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck(os.Getenv("HTTP_ADDR")))
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("version", version)
 	if err := run(log); err != nil {
 		log.Error("fatal", "error", err)

@@ -1,0 +1,87 @@
+# Stack "automation": n8n with its own PostgreSQL database.
+#
+#   deploy stack automation      (requires a healthy platform stack)
+#
+# The editor is restricted to ADMIN_CIDRS: the first visitor creates the
+# owner account, so it must not be reachable by everyone. Applications call
+# webhooks over the internal "data" network (http://automation_n8n:5678), so
+# no public webhook route is needed. See docs/adding-an-app.md to expose one.
+#
+# On the first boot the example workflow (dev/n8n/note-created.json) is
+# imported and published; later edits made in the editor are kept.
+
+services:
+  n8n:
+    image: n8nio/n8n:2.38.7@sha256:a8c95f75c6fdf65f5f2b7a7b354744eaa1c62bb911b5c00af6499c3f38e4cd32
+    entrypoint: ["tini", "--", "sh", "/usr/local/bin/n8n-start.sh"]
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: platform_postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD_FILE: /run/secrets/n8n_db_password
+      N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+      N8N_HOST: ${N8N_DOMAIN}
+      N8N_PROTOCOL: https
+      N8N_PROXY_HOPS: "1"
+      WEBHOOK_URL: https://${N8N_DOMAIN}/
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
+    secrets: [n8n_db_password, n8n_encryption_key]
+    configs:
+      - source: n8n_start
+        target: /usr/local/bin/n8n-start.sh
+        mode: 0444
+      - source: n8n_note_created
+        target: /workflows/note-created.json
+        mode: 0444
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks: [edge, data]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    deploy:
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 60s
+      rollback_config:
+        order: stop-first
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.n8n.rule=Host(`${N8N_DOMAIN}`)
+        - traefik.http.routers.n8n.entrypoints=websecure
+        - traefik.http.routers.n8n.middlewares=admin-allowlist@swarm
+        - traefik.http.services.n8n.loadbalancer.server.port=5678
+      resources:
+        limits: { memory: 768M }
+
+configs:
+  # Content-addressed names: Swarm configs are immutable, a change gets a new name.
+  n8n_start:
+    name: n8n_start_${N8N_START_HASH}
+    file: ../n8n/n8n-start.sh
+  n8n_note_created:
+    name: n8n_note_created_${N8N_WORKFLOW_HASH}
+    file: ../../dev/n8n/note-created.json
+
+secrets:
+  n8n_db_password:
+    external: true
+    name: ${N8N_DB_PASSWORD_SECRET}
+  n8n_encryption_key:
+    external: true
+    name: ${N8N_ENCRYPTION_KEY_SECRET}
+
+networks:
+  edge: { external: true }
+  data: { external: true }
+
+volumes:
+  n8n_data:
